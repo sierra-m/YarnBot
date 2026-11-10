@@ -99,3 +99,7 @@ Resistor tolerance and ADC error make the printed battery voltage a little off. 
 4. Re-upload and check again.
 
 Accuracy matters most near the 9.9 V cutoff. If you have an adjustable bench supply, calibrate at about 10 V.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
