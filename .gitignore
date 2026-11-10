@@ -1,0 +1,8 @@
+# arduino-cli output from --export-binaries (-e) or --output-dir
+build/
+
+# Compiled firmware artifacts
+*.bin
+*.elf
+*.map
+*.hex
