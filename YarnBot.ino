@@ -7,36 +7,46 @@
 // divider has ~77 kOhm source impedance; the cap keeps ADC readings stable.
 
 #include <Arduino.h>
+#include <driver/mcpwm_cap.h>
 
 // ---------------------------------------------------------------- Config ----
 
 #define DEBUG 1  // set to 0 to disable Serial debug output
+#define RC_STATS 0     // 1 = print per-channel pulse min/max/avg once per second
+#define RC_LOOPBACK 0  // 1 = bench test: output a fixed pulse on PIN_LOOPBACK, motors forced off
 
 // Pins
 constexpr uint8_t PIN_RC_THROTTLE = 18;
-constexpr uint8_t PIN_RC_STEER    = 19;
-constexpr uint8_t PIN_L_IN1       = 20;
+constexpr uint8_t PIN_RC_STEER    = 20;
+constexpr uint8_t PIN_L_IN1       = 19;
 constexpr uint8_t PIN_L_IN2       = 21;
 constexpr uint8_t PIN_R_IN1       = 22;
 constexpr uint8_t PIN_R_IN2       = 23;
 constexpr uint8_t PIN_BAT         = 2;   // ADC1_CH2
+constexpr uint8_t PIN_LOOPBACK    = 1;   // RC_LOOPBACK test output; jumper to an RC input pin
 
 // RC calibration (microseconds)
 constexpr uint16_t RC_MIN        = 1000;
 constexpr uint16_t RC_MID        = 1500;
 constexpr uint16_t RC_MAX        = 2000;
-constexpr uint16_t RC_DEADBAND   = 40;
+constexpr uint16_t RC_DEADBAND   = 20;
 constexpr uint16_t RC_VALID_MIN  = 800;   // pulses outside this window are ignored
 constexpr uint16_t RC_VALID_MAX  = 2200;
 constexpr uint32_t RC_TIMEOUT_MS = 100;   // failsafe if no pulse for this long
 constexpr bool     REVERSE_THROTTLE = false;
 constexpr bool     REVERSE_STEER    = false;
+constexpr uint32_t RC_CAP_RES_HZ    = 10000000;  // MCPWM capture timer tick rate (0.1 us)
+
+// RC_LOOPBACK test pulse
+constexpr uint16_t LOOPBACK_US       = 1500;
+constexpr uint32_t LOOPBACK_HZ       = 50;
+constexpr uint8_t  LOOPBACK_RES_BITS = 16;  // ~0.3 us per step at 50 Hz
 
 // Motor output
 constexpr uint32_t PWM_FREQ_HZ   = 20000;
 constexpr uint8_t  PWM_RES_BITS  = 10;
 constexpr uint32_t PWM_MAX       = (1u << PWM_RES_BITS) - 1;
-constexpr bool     INVERT_LEFT   = false;
+constexpr bool     INVERT_LEFT   = true;
 constexpr bool     INVERT_RIGHT  = false;
 constexpr float    SLEW_PER_SEC  = 4.0f;  // full-scale units/sec; 0 disables slew limiting
 
@@ -51,31 +61,85 @@ constexpr float    BAT_EMA_ALPHA    = 0.05f;
 
 // ------------------------------------------------------------- RC input ----
 
+// Pulse widths are measured with the MCPWM capture peripheral: the hardware
+// latches a timer value at each edge, so interrupt latency doesn't affect the
+// result (a micros()-in-ISR approach jittered by up to ~130 us).
 struct RcChannel {
   uint8_t pin;
-  volatile uint32_t riseUs;
+  volatile uint32_t riseTicks;
+  volatile bool     riseSeen;    // a rising edge is waiting for its falling edge
   volatile uint16_t widthUs;
   volatile uint32_t lastUpdateMs;
+  // RC_STATS accumulators, reset each time they are read
+  volatile uint16_t statMin;
+  volatile uint16_t statMax;
+  volatile uint32_t statSum;
+  volatile uint32_t statCount;
 };
 
-static RcChannel rcThrottle = {PIN_RC_THROTTLE, 0, 0, 0};
-static RcChannel rcSteer    = {PIN_RC_STEER,    0, 0, 0};
+static RcChannel rcThrottle = {PIN_RC_THROTTLE, 0, false, 0, 0, 0, 0, 0, 0};
+static RcChannel rcSteer    = {PIN_RC_STEER,    0, false, 0, 0, 0, 0, 0, 0};
 static portMUX_TYPE rcMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t rcTicksPerUs = RC_CAP_RES_HZ / 1000000;  // updated from the driver in rcBegin()
 
-static void IRAM_ATTR rcIsr(void *arg) {
+static bool IRAM_ATTR rcOnCapture(mcpwm_cap_channel_handle_t, const mcpwm_capture_event_data_t *ev,
+                                  void *arg) {
   RcChannel *ch = static_cast<RcChannel *>(arg);
-  const uint32_t now = micros();
-  if (digitalRead(ch->pin)) {
-    ch->riseUs = now;
-  } else {
-    const uint32_t w = now - ch->riseUs;
-    if (w >= RC_VALID_MIN && w <= RC_VALID_MAX) {
-      portENTER_CRITICAL_ISR(&rcMux);
-      ch->widthUs = static_cast<uint16_t>(w);
-      ch->lastUpdateMs = millis();
-      portEXIT_CRITICAL_ISR(&rcMux);
-    }
+  if (ev->cap_edge == MCPWM_CAP_EDGE_POS) {
+    ch->riseTicks = ev->cap_value;
+    ch->riseSeen = true;
+    return false;
   }
+  if (!ch->riseSeen) return false;  // falling edge without a matching rise: ignore
+  ch->riseSeen = false;
+
+  const uint32_t ticks = ev->cap_value - ch->riseTicks;  // wraps correctly
+  const uint32_t w = (ticks + rcTicksPerUs / 2) / rcTicksPerUs;
+  if (w >= RC_VALID_MIN && w <= RC_VALID_MAX) {
+    portENTER_CRITICAL_ISR(&rcMux);
+    ch->widthUs = static_cast<uint16_t>(w);
+    ch->lastUpdateMs = millis();
+#if RC_STATS
+    if (ch->statCount == 0 || w < ch->statMin) ch->statMin = static_cast<uint16_t>(w);
+    if (w > ch->statMax) ch->statMax = static_cast<uint16_t>(w);
+    ch->statSum = ch->statSum + w;
+    ch->statCount = ch->statCount + 1;
+#endif
+    portEXIT_CRITICAL_ISR(&rcMux);
+  }
+  return false;
+}
+
+// Set up one capture timer with a channel per RC input. Returns false on any
+// driver error; the inputs then never update, so the failsafe keeps motors off.
+static bool rcBegin() {
+  mcpwm_cap_timer_handle_t timer = nullptr;
+  mcpwm_capture_timer_config_t tcfg = {};
+  tcfg.group_id = 0;
+  tcfg.clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT;
+  tcfg.resolution_hz = RC_CAP_RES_HZ;
+  if (mcpwm_new_capture_timer(&tcfg, &timer) != ESP_OK) return false;
+
+  uint32_t resHz = 0;
+  if (mcpwm_capture_timer_get_resolution(timer, &resHz) != ESP_OK || resHz < 1000000) return false;
+  rcTicksPerUs = resHz / 1000000;
+
+  for (RcChannel *ch : {&rcThrottle, &rcSteer}) {
+    mcpwm_cap_channel_handle_t chan = nullptr;
+    mcpwm_capture_channel_config_t ccfg = {};
+    ccfg.gpio_num = ch->pin;
+    ccfg.prescale = 1;
+    ccfg.flags.pos_edge = 1;
+    ccfg.flags.neg_edge = 1;
+    if (mcpwm_new_capture_channel(timer, &ccfg, &chan) != ESP_OK) return false;
+    mcpwm_capture_event_callbacks_t cbs = {};
+    cbs.on_cap = rcOnCapture;
+    if (mcpwm_capture_channel_register_event_callbacks(chan, &cbs, ch) != ESP_OK) return false;
+    if (mcpwm_capture_channel_enable(chan) != ESP_OK) return false;
+  }
+
+  return mcpwm_capture_timer_enable(timer) == ESP_OK &&
+         mcpwm_capture_timer_start(timer) == ESP_OK;
 }
 
 static void rcSnapshot(const RcChannel &ch, uint16_t &width, uint32_t &lastMs) {
@@ -84,6 +148,27 @@ static void rcSnapshot(const RcChannel &ch, uint16_t &width, uint32_t &lastMs) {
   lastMs = ch.lastUpdateMs;
   portEXIT_CRITICAL(&rcMux);
 }
+
+#if RC_STATS
+// Print and reset the stats for one channel, e.g. "thr n=50 min=1498 max=1503 avg=1500.4 spread=5".
+static void rcPrintStats(const char *name, RcChannel &ch) {
+  portENTER_CRITICAL(&rcMux);
+  const uint16_t mn = ch.statMin, mx = ch.statMax;
+  const uint32_t sum = ch.statSum, n = ch.statCount;
+  ch.statMin = 0;
+  ch.statMax = 0;
+  ch.statSum = 0;
+  ch.statCount = 0;
+  portEXIT_CRITICAL(&rcMux);
+  if (n == 0) {
+    Serial.printf("%s n=0 (no valid pulses)", name);
+  } else {
+    Serial.printf("%s n=%lu min=%u max=%u avg=%.1f spread=%u", name,
+                  static_cast<unsigned long>(n), mn, mx,
+                  static_cast<double>(sum) / n, mx - mn);
+  }
+}
+#endif
 
 // Map a pulse width to -1..+1 with a center deadband.
 static float rcNormalize(uint16_t us, bool reverse) {
@@ -102,18 +187,28 @@ static float rcNormalize(uint16_t us, bool reverse) {
 
 // --------------------------------------------------------- Motor output ----
 
+// ledcWrite only when the duty changes; loop() runs far faster than the PWM
+// period, and rewriting the same value every pass is wasted driver work.
+static uint32_t pwmDuty[SOC_GPIO_PIN_COUNT];  // all 0, matching setup()
+
+static void pwmWrite(uint8_t pin, uint32_t duty) {
+  if (pwmDuty[pin] == duty) return;
+  pwmDuty[pin] = duty;
+  ledcWrite(pin, duty);
+}
+
 static void setMotor(uint8_t in1, uint8_t in2, float value, bool invert) {
   if (invert) value = -value;
   const uint32_t duty = static_cast<uint32_t>(lroundf(fabsf(value) * PWM_MAX));
   if (value > 0.0f) {
-    ledcWrite(in2, 0);
-    ledcWrite(in1, duty);
+    pwmWrite(in2, 0);
+    pwmWrite(in1, duty);
   } else if (value < 0.0f) {
-    ledcWrite(in1, 0);
-    ledcWrite(in2, duty);
+    pwmWrite(in1, 0);
+    pwmWrite(in2, duty);
   } else {
-    ledcWrite(in1, 0);  // coast
-    ledcWrite(in2, 0);
+    pwmWrite(in1, 0);  // coast
+    pwmWrite(in2, 0);
   }
 }
 
@@ -182,10 +277,23 @@ void setup() {
     ledcWrite(pin, 0);
   }
 
-  pinMode(PIN_RC_THROTTLE, INPUT);
-  pinMode(PIN_RC_STEER, INPUT);
-  attachInterruptArg(digitalPinToInterrupt(PIN_RC_THROTTLE), rcIsr, &rcThrottle, CHANGE);
-  attachInterruptArg(digitalPinToInterrupt(PIN_RC_STEER), rcIsr, &rcSteer, CHANGE);
+  if (!rcBegin()) {
+    Serial.println("RC capture setup FAILED - no RC input, motors will stay off");
+  }
+
+#if RC_LOOPBACK
+  // Fixed test pulse. Jumper PIN_LOOPBACK to the throttle and/or steering pin
+  // (receiver unplugged from those pins). Motors stay off in this mode.
+  if (ledcAttach(PIN_LOOPBACK, LOOPBACK_HZ, LOOPBACK_RES_BITS)) {
+    const uint32_t duty = static_cast<uint32_t>(
+        lround(static_cast<double>(LOOPBACK_US) * LOOPBACK_HZ * (1u << LOOPBACK_RES_BITS) / 1e6));
+    ledcWrite(PIN_LOOPBACK, duty);
+    Serial.printf("LOOPBACK TEST: %u us @ %lu Hz on GPIO%u, motors disabled\n", LOOPBACK_US,
+                  static_cast<unsigned long>(LOOPBACK_HZ), PIN_LOOPBACK);
+  } else {
+    Serial.println("LOOPBACK TEST: ledcAttach failed");
+  }
+#endif
 
   analogReadResolution(12);
   analogSetPinAttenuation(PIN_BAT, ADC_11db);
@@ -240,7 +348,7 @@ void loop() {
   float right = constrain(throttle - steer, -1.0f, 1.0f);
 
   // 4. Safety gates
-  if (cutoffLatched || !signalOk || !armed) {
+  if (RC_LOOPBACK || cutoffLatched || !signalOk || !armed) {
     left = right = 0.0f;
   }
 
@@ -264,6 +372,18 @@ void loop() {
                   thrUs, strUs, throttle, steer, outLeft, outRight, vbatFiltered,
                   signalOk ? "" : " NOSIG", armed ? "" : " DISARMED",
                   cutoffLatched ? " CUTOFF" : "");
+  }
+#endif
+
+#if RC_STATS
+  static uint32_t lastStatsMs = 0;
+  if (nowMs - lastStatsMs >= 1000) {
+    lastStatsMs = nowMs;
+    Serial.print("STATS ");
+    rcPrintStats("thr", rcThrottle);
+    Serial.print(" | ");
+    rcPrintStats("str", rcSteer);
+    Serial.println();
   }
 #endif
 }
