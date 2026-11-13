@@ -16,8 +16,8 @@ YarnBot is an ESP32-C6 sketch for a two-motor, tank-steered robot. It reads two 
 | Signal | ESP32-C6 GPIO |
 |---|---|
 | RC throttle channel | 18 |
-| RC steering channel | 19 |
-| Left IBT-4 IN1 / IN2 | 20 / 21 |
+| RC steering channel | 20 |
+| Left IBT-4 IN1 / IN2 | 19 / 21 |
 | Right IBT-4 IN1 / IN2 | 22 / 23 |
 | Battery divider midpoint | 2 |
 
@@ -55,10 +55,12 @@ arduino-cli core install esp32:esp32
 Then, from this folder:
 
 ```
-arduino-cli compile --fqbn esp32:esp32:esp32c6 .
-arduino-cli upload -p <port> --fqbn esp32:esp32:esp32c6 .
+arduino-cli compile --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc .
+arduino-cli upload -p <port> --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc .
 arduino-cli monitor -p <port> -c baudrate=115200
 ```
+
+`CDCOnBoot=cdc` sends Serial output over the C6's native USB port. Without it, Serial goes to the UART0 pins (GPIO 16/17) and the USB serial monitor stays blank. In the Arduino IDE, the same setting is **Tools → USB CDC On Boot → Enabled**. On Linux the native USB port usually shows up as `/dev/ttyACM0`.
 
 ## Configuration
 
@@ -74,6 +76,8 @@ Every setting is a constant at the top of `YarnBot.ino`:
 | `CUTOFF_V`, `CUTOFF_HOLD_MS` | Low-battery threshold and how long the voltage must stay below it |
 | `BAT_CAL` | Battery reading correction factor |
 | `DEBUG` | Turn the Serial debug output on (1) or off (0) |
+| `RC_STATS` | Print each channel's pulse min/max/average once per second (1) |
+| `RC_LOOPBACK`, `PIN_LOOPBACK`, `LOOPBACK_US` | Bench test of the RC measurement; see [Bench testing](#bench-testing) |
 
 ## Bench testing
 
@@ -88,6 +92,18 @@ From left to right: the raw throttle and steering pulse widths, the normalized t
 1. Check that the pulse widths read about 1000 µs, 1500 µs and 2000 µs at the stick ends and center. If they don't, adjust `RC_MIN`, `RC_MID` and `RC_MAX`.
 2. Check each stick corner against the [Controls](#controls) table. Use `INVERT_LEFT`, `INVERT_RIGHT` or the `REVERSE_*` flags to fix any direction that's wrong.
 3. Switch off the transmitter. The motors should stop right away.
+
+### Checking RC signal quality
+
+Set `RC_STATS` to 1 to get a line like this once per second:
+
+```
+STATS thr n=50 min=1500 max=1500 avg=1500.0 spread=0 | str n=58 min=1500 max=1500 avg=1500.0 spread=0
+```
+
+`n` is the number of pulses received that second, and `spread` is max − min. With the sticks centered, the spread should be a few µs at most. `RC_DEADBAND` only has to cover that spread plus any slop in the stick centering. If the average isn't near `RC_MID`, adjust the subtrim on your transmitter or change `RC_MID`.
+
+To check the ESP32's measurement without the receiver, set `RC_LOOPBACK` to 1. The sketch then outputs a fixed `LOOPBACK_US` pulse (1500 µs) on `PIN_LOOPBACK` (GPIO 1) and keeps the motors off. Unplug the receiver from the throttle input, jumper `PIN_LOOPBACK` to GPIO 18, and the throttle stats should show exactly that width. Set `RC_LOOPBACK` back to 0 when you're done.
 
 ## Battery calibration
 
